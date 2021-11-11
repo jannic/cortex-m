@@ -48,6 +48,69 @@ pub unsafe fn enable() {
     call_asm!(__cpsie());
 }
 
+cfg_if::cfg_if! {
+    if #[cfg(feature = "custom-impl")] {
+        /// Methods required for a custom critical section implementation.
+        ///
+        /// This trait is not intended to be used except when implementing a custom critical section.
+        ///
+        /// Implementations must uphold the contract specified in [`crate::acquire`] and [`crate::release`].
+        pub unsafe trait Impl {
+            /// Acquire the critical section.
+            unsafe fn acquire() -> u8;
+            /// Release the critical section.
+            unsafe fn release(token: u8);
+        }
+
+        /// Set the custom critical section implementation.
+        ///
+        /// # Example
+        ///
+        /// ```
+        /// struct MyCriticalSection;
+        /// critical_section::custom_impl!(MyCriticalSection);
+        ///
+        /// unsafe impl critical_section::Impl for MyCriticalSection {
+        ///     unsafe fn acquire() -> u8 {
+        ///         // ...
+        ///         # return 0
+        ///     }
+        ///
+        ///     unsafe fn release(token: u8) {
+        ///         // ...
+        ///     }
+        /// }
+        ///
+        #[macro_export]
+        macro_rules! custom_impl {
+            ($t: ty) => {
+                #[no_mangle]
+                unsafe fn _critical_section_acquire() -> u8 {
+                    <$t as $crate::interrupt::Impl>::acquire()
+                }
+                #[no_mangle]
+                unsafe fn _critical_section_release(token: u8) {
+                    <$t as $crate::interrupt::Impl>::release(token)
+                }
+            };
+        }
+    } else {
+        #[no_mangle]
+        unsafe fn _critical_section_acquire() -> u8 {
+            let primask = crate::register::primask::read();
+            crate::interrupt::disable();
+            primask.is_active() as _
+        }
+
+        #[no_mangle]
+        unsafe fn _critical_section_release(token: u8) {
+            if token != 0 {
+                crate::interrupt::enable()
+            }
+        }
+    }
+}
+
 /// Execute closure `f` in an interrupt-free context.
 ///
 /// This as also known as a "critical section".
@@ -56,18 +119,17 @@ pub fn free<F, R>(f: F) -> R
 where
     F: FnOnce(&CriticalSection) -> R,
 {
-    let primask = crate::register::primask::read();
 
-    // disable interrupts
-    disable();
+    extern "Rust" {
+        fn _critical_section_acquire() -> u8;
+        fn _critical_section_release(token: u8);
+    }
+
+    let token = unsafe { _critical_section_acquire() };
 
     let r = f(unsafe { &CriticalSection::new() });
 
-    // If the interrupts were active before our `disable` call, then re-enable
-    // them. Otherwise, keep them disabled
-    if primask.is_active() {
-        unsafe { enable() }
-    }
+    unsafe { _critical_section_release(token) };
 
     r
 }
